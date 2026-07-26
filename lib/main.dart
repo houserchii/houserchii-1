@@ -37,7 +37,7 @@ class ThermostatScreen extends StatefulWidget {
 
 class _ThermostatScreenState extends State<ThermostatScreen> with TickerProviderStateMixin {
   // 🛜 МРЕЖОВИ НАСТРОЙКИ (HTTP & MQTT)
-  final TextEditingController _ipController = TextEditingController(text: '192.168.1.100');
+  final TextEditingController _ipController = TextEditingController(text: '192.168.4.1');
   final TextEditingController _mqttBrokerController = TextEditingController(text: 'broker.hivemq.com');
   final TextEditingController _mqttTopicController = TextEditingController(text: 'home/ac/control');
   
