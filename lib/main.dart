@@ -1,7 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:mqtt_client/mqtt_client.dart';
+import 'package:mqtt_client/mqtt_server_client.dart';
 
 void main() {
   runApp(const PremiumACApp());
@@ -31,50 +36,48 @@ class ThermostatScreen extends StatefulWidget {
 }
 
 class _ThermostatScreenState extends State<ThermostatScreen> with TickerProviderStateMixin {
+  // 🛜 МРЕЖОВИ НАСТРОЙКИ (HTTP & MQTT)
+  final TextEditingController _ipController = TextEditingController(text: '192.168.1.100');
+  final TextEditingController _mqttBrokerController = TextEditingController(text: 'broker.hivemq.com');
+  final TextEditingController _mqttTopicController = TextEditingController(text: 'home/ac/control');
+  
+  bool isConnectedToNodeMCU = false;
+  bool isMqttConnected = false;
+  Timer? _syncTimer;
+  MqttServerClient? _mqttClient;
+
   double targetTemp = 22.0;
   double currentRoomTemp = 24.5;
-  
-  // ⚡ По подразбиране е ИЗКЛЮЧЕНО
   bool isPowerOn = false; 
 
-  // Външни данни от мрежата / локация
   double externalTemp = 28.0;
   int externalHumidity = 40;
 
-  // Час и дата в реално време
   Timer? _clockTimer;
   String _currentTime = '';
   String _currentDate = '';
 
-  // Текущо активни настройки на релето (в секунди)
-  int activeWorkSeconds = 240; // 4 мин
-  int activeRestSeconds = 180; // 3 мин
-
-  // Избрани нови настройки от слайдърите (в секунди)
+  int activeWorkSeconds = 240;
+  int activeRestSeconds = 180;
   int pendingWorkSeconds = 240;
   int pendingRestSeconds = 180;
-
-  // Флаг дали настройките са променени и чакат следващ цикъл
   bool hasPendingChanges = false;
 
-  // Логика за цикли
   bool isCompressorRunning = false;
   int remainingSeconds = 240;
   Timer? _cycleTimer;
 
-  // Падащо меню за настройки
   bool isSettingsExpanded = false;
 
-  // Анимация за снежинки
   late AnimationController _snowflakeController;
   final List<Snowflake> _snowflakes = List.generate(20, (index) => Snowflake());
 
   @override
   void initState() {
     super.initState();
+    _loadSavedSettings();
     _updateDateTime();
 
-    // Обновяване на часовника всяка секунда
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       _updateDateTime();
     });
@@ -85,6 +88,89 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
       vsync: this,
       duration: const Duration(seconds: 10),
     )..repeat();
+
+    _syncTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
+      _syncWithNodeMCU();
+    });
+  }
+
+  // 💾 Зареждане на запазените мрежови настройки
+  Future<void> _loadSavedSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _ipController.text = prefs.getString('nodemcu_ip') ?? '192.168.1.100';
+      _mqttBrokerController.text = prefs.getString('mqtt_broker') ?? 'broker.hivemq.com';
+      _mqttTopicController.text = prefs.getString('mqtt_topic') ?? 'home/ac/control';
+    });
+  }
+
+  // 💾 Записване на мрежовите настройки в паметта
+  Future<void> _saveSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('nodemcu_ip', _ipController.text.trim());
+    await prefs.setString('mqtt_broker', _mqttBrokerController.text.trim());
+    await prefs.setString('mqtt_topic', _mqttTopicController.text.trim());
+  }
+
+  // 🔌 Инициализиране и свързване към MQTT брокер за отдалечен достъп
+  Future<void> _connectMqtt() async {
+    String broker = _mqttBrokerController.text.trim();
+    if (broker.isEmpty) return;
+
+    _mqttClient = MqttServerClient(broker, 'flutter_ac_client_${DateTime.now().millisecondsSinceEpoch}');
+    _mqttClient!.port = 1883;
+    _mqttClient!.keepAlivePeriod = 20;
+    _mqttClient!.logging(on: false);
+
+    final connMessage = MqttConnectMessage()
+        .withClientIdentifier('FlutterAcClient')
+        .startClean();
+    _mqttClient!.connectionMessage = connMessage;
+
+    try {
+      await _mqttClient!.connect();
+    } catch (e) {
+      _mqttClient!.disconnect();
+      setState(() => isMqttConnected = false);
+      return;
+    }
+
+    if (_mqttClient!.connectionStatus!.state == MqttConnectionState.connected) {
+      setState(() => isMqttConnected = true);
+      
+      // Абониране за топик за обратна връзка (ако NodeMCU връща данни натам)
+      String topic = _mqttTopicController.text.trim();
+      _mqttClient!.subscribe(topic, MqttQos.atMostOnce);
+
+     _mqttClient!.updates!.listen((List<MqttReceivedMessage<MqttMessage?>> c) {
+        final recMess = c[0].payload as MqttPublishMessage;
+        final payload = const Utf8Decoder().convert(recMess.payload.message);
+        // Тук може да парсираш JSON от MQTT
+      });
+    } else {
+      setState(() => isMqttConnected = false);
+    }
+  }
+
+  // 📡 Изпращане на команда през MQTT (за отдалечен достъп)
+  void _sendMqttCommand() {
+    if (_mqttClient == null || _mqttClient!.connectionStatus!.state != MqttConnectionState.connected) {
+      _connectMqtt();
+      return;
+    }
+
+    String topic = _mqttTopicController.text.trim();
+    final builder = MqttClientPayloadBuilder();
+    
+    final payloadMap = {
+      "power": isPowerOn ? 1 : 0,
+      "target": targetTemp,
+      "work": activeWorkSeconds,
+      "rest": activeRestSeconds
+    };
+    
+    builder.addString(jsonEncode(payloadMap));
+    _mqttClient!.publishMessage(topic, MqttQos.atMostOnce, builder.payload!);
   }
 
   void _updateDateTime() {
@@ -99,13 +185,43 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
   void dispose() {
     _clockTimer?.cancel();
     _cycleTimer?.cancel();
+    _syncTimer?.cancel();
+    _ipController.dispose();
+    _mqttBrokerController.dispose();
+    _mqttTopicController.dispose();
+    _mqttClient?.disconnect();
     _snowflakeController.dispose();
     super.dispose();
   }
 
+  Future<void> _syncWithNodeMCU() async {
+    final ip = _ipController.text.trim();
+    if (ip.isEmpty) return;
+
+    try {
+      final url = Uri.parse('http://$ip/update?power=${isPowerOn ? 1 : 0}&target=$targetTemp&work=$activeWorkSeconds&rest=$activeRestSeconds');
+      final response = await http.get(url).timeout(const Duration(seconds: 2));
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        setState(() {
+          isConnectedToNodeMCU = true;
+          if (data['roomTemp'] != null) currentRoomTemp = (data['roomTemp'] as num).toDouble();
+          if (data['extTemp'] != null) externalTemp = (data['extTemp'] as num).toDouble();
+          if (data['humidity'] != null) externalHumidity = data['humidity'] as int;
+          if (data['compressor'] != null) isCompressorRunning = data['compressor'] == 1;
+          if (data['remaining'] != null) remainingSeconds = data['remaining'] as int;
+        });
+      }
+    } catch (e) {
+      setState(() {
+        isConnectedToNodeMCU = false;
+      });
+    }
+  }
+
   void _startCompressorCycle() {
     _cycleTimer?.cancel();
-
     _cycleTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       if (!isPowerOn) return;
 
@@ -113,12 +229,10 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
         if (remainingSeconds > 0) {
           remainingSeconds--;
         } else {
-          // При приключване на цикъла прилагаме новите настройки, ако има промяна
           activeWorkSeconds = pendingWorkSeconds;
           activeRestSeconds = pendingRestSeconds;
           hasPendingChanges = false;
 
-          // Смяна на цикъла (работа <-> почивка)
           isCompressorRunning = !isCompressorRunning;
           remainingSeconds = isCompressorRunning ? activeWorkSeconds : activeRestSeconds;
         }
@@ -137,7 +251,6 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
     return Scaffold(
       body: Stack(
         children: [
-          // Background Gradient
           Container(
             decoration: const BoxDecoration(
               gradient: RadialGradient(
@@ -148,7 +261,6 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
             ),
           ),
 
-          // ❄️ Падащи снежинки (когато е включено)
           if (isPowerOn)
             AnimatedBuilder(
               animation: _snowflakeController,
@@ -160,7 +272,6 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
               },
             ),
 
-          // Main Content
           SafeArea(
             child: SingleChildScrollView(
               physics: const BouncingScrollPhysics(),
@@ -168,12 +279,8 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                 padding: const EdgeInsets.symmetric(horizontal: 20.0, vertical: 12.0),
                 child: Column(
                   children: [
-                    // 🌐 ПАНЕЛ: Дата, Час и Мрежова прогноза
                     _buildNetworkHeader(),
-
                     const SizedBox(height: 16),
-
-                    // 🔝 Главна заглавна лента
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
@@ -182,11 +289,7 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                           children: [
                             const Text(
                               'Климатизация',
-                              style: TextStyle(
-                                fontSize: 24,
-                                fontWeight: FontWeight.bold,
-                                color: Colors.white,
-                              ),
+                              style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.white),
                             ),
                             const SizedBox(height: 2),
                             Row(
@@ -197,24 +300,12 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                                   decoration: BoxDecoration(
                                     shape: BoxShape.circle,
                                     color: isPowerOn ? const Color(0xFF00E5FF) : Colors.redAccent,
-                                    boxShadow: [
-                                      BoxShadow(
-                                        color: isPowerOn ? const Color(0xFF00E5FF) : Colors.redAccent,
-                                        blurRadius: 8,
-                                        spreadRadius: 1,
-                                      )
-                                    ],
                                   ),
                                 ),
                                 const SizedBox(width: 6),
                                 Text(
                                   isPowerOn ? 'АКТИВЕН' : 'ИЗКЛЮЧЕН',
-                                  style: TextStyle(
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.grey[400],
-                                    letterSpacing: 1.0,
-                                  ),
+                                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey[400], letterSpacing: 1.0),
                                 ),
                               ],
                             ),
@@ -223,10 +314,9 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                         _buildPowerButton(),
                       ],
                     ),
-
                     const SizedBox(height: 15),
 
-                    // 🎛️ Въртящо се колело (Thermostat Wheel)
+                    // Термостат колело
                     GestureDetector(
                       onPanUpdate: isPowerOn
                           ? (details) {
@@ -240,21 +330,6 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                       child: Stack(
                         alignment: Alignment.center,
                         children: [
-                          AnimatedContainer(
-                            duration: const Duration(milliseconds: 300),
-                            width: 220,
-                            height: 220,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              boxShadow: [
-                                BoxShadow(
-                                  color: isPowerOn ? const Color(0xFF00E5FF).withOpacity(0.2) : Colors.transparent,
-                                  blurRadius: 60,
-                                  spreadRadius: 10,
-                                )
-                              ],
-                            ),
-                          ),
                           SizedBox(
                             width: 210,
                             height: 210,
@@ -271,25 +346,13 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                             decoration: const BoxDecoration(
                               shape: BoxShape.circle,
                               color: Color(0xFF0E131F),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: Colors.black54,
-                                  blurRadius: 15,
-                                  offset: Offset(0, 8),
-                                )
-                              ],
                             ),
                             child: Column(
                               mainAxisAlignment: MainAxisAlignment.center,
                               children: [
                                 Text(
                                   'СТАЙНА ${currentRoomTemp.toStringAsFixed(1)}°C',
-                                  style: TextStyle(
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.grey[500],
-                                    letterSpacing: 1.2,
-                                  ),
+                                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey[500]),
                                 ),
                                 const SizedBox(height: 4),
                                 Row(
@@ -298,42 +361,10 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                                   children: [
                                     Text(
                                       targetTemp.toStringAsFixed(1),
-                                      style: TextStyle(
-                                        fontSize: 44,
-                                        fontWeight: FontWeight.w900,
-                                        color: isPowerOn ? Colors.white : Colors.grey[700],
-                                        height: 1,
-                                      ),
+                                      style: TextStyle(fontSize: 44, fontWeight: FontWeight.w900, color: isPowerOn ? Colors.white : Colors.grey[700], height: 1),
                                     ),
-                                    Text(
-                                      '°C',
-                                      style: TextStyle(
-                                        fontSize: 18,
-                                        fontWeight: FontWeight.bold,
-                                        color: isPowerOn ? const Color(0xFF00E5FF) : Colors.grey[700],
-                                      ),
-                                    ),
+                                    Text('°C', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: isPowerOn ? const Color(0xFF00E5FF) : Colors.grey[700])),
                                   ],
-                                ),
-                                const SizedBox(height: 6),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-                                  decoration: BoxDecoration(
-                                    color: isPowerOn ? const Color(0xFF00E5FF).withOpacity(0.1) : Colors.white10,
-                                    borderRadius: BorderRadius.circular(15),
-                                    border: Border.all(
-                                      color: isPowerOn ? const Color(0xFF00E5FF).withOpacity(0.3) : Colors.transparent,
-                                    ),
-                                  ),
-                                  child: Text(
-                                    'ПЛЪЗНИ ЗА РЕГУЛАЦИЯ',
-                                    style: TextStyle(
-                                      fontSize: 8,
-                                      fontWeight: FontWeight.bold,
-                                      color: isPowerOn ? const Color(0xFF00E5FF) : Colors.grey[600],
-                                      letterSpacing: 1.0,
-                                    ),
-                                  ),
                                 ),
                               ],
                             ),
@@ -343,144 +374,57 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                     ),
 
                     const SizedBox(height: 15),
-
-                    // ➕ / ➖ Бутони
                     Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         _buildCircleControlBtn(
                           icon: Icons.remove_rounded,
-                          onTap: isPowerOn
-                              ? () => setState(() {
-                                    if (targetTemp > 16.0) targetTemp -= 0.5;
-                                  })
-                              : null,
+                          onTap: isPowerOn ? () => setState(() { if (targetTemp > 16.0) targetTemp -= 0.5; }) : null,
                         ),
                         const SizedBox(width: 30),
                         _buildCircleControlBtn(
                           icon: Icons.add_rounded,
-                          onTap: isPowerOn
-                              ? () => setState(() {
-                                    if (targetTemp < 30.0) targetTemp += 0.5;
-                                  })
-                              : null,
+                          onTap: isPowerOn ? () => setState(() { if (targetTemp < 30.0) targetTemp += 0.5; }) : null,
                           isPrimary: true,
                         ),
                       ],
                     ),
 
                     const SizedBox(height: 20),
-
-                    // ⏱️ Панел за Таймер на Релето (Жив брояч)
+                    
+                    // Брояч таймер
                     Container(
                       width: double.infinity,
                       padding: const EdgeInsets.all(14),
                       decoration: BoxDecoration(
                         color: Colors.white.withOpacity(0.04),
                         borderRadius: BorderRadius.circular(20),
-                        border: Border.all(
-                          color: isPowerOn
-                              ? (isCompressorRunning
-                                  ? const Color(0xFF00E5FF).withOpacity(0.4)
-                                  : Colors.orangeAccent.withOpacity(0.4))
-                              : Colors.white10,
-                        ),
+                        border: Border.all(color: Colors.white10),
                       ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Row(
-                                children: [
-                                  Icon(
-                                    !isPowerOn
-                                        ? Icons.power_settings_new
-                                        : (isCompressorRunning ? Icons.play_circle_fill : Icons.pause_circle_filled),
-                                    size: 20,
-                                    color: !isPowerOn
-                                        ? Colors.grey
-                                        : (isCompressorRunning ? const Color(0xFF00E5FF) : Colors.orangeAccent),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Text(
-                                    !isPowerOn
-                                        ? 'Компресор: В ОЧАКВАНЕ'
-                                        : (isCompressorRunning ? 'Компресор: РАБОТА' : 'Компресор: ПОЧИВКА'),
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      fontWeight: FontWeight.bold,
-                                      color: !isPowerOn
-                                          ? Colors.grey
-                                          : (isCompressorRunning ? const Color(0xFF00E5FF) : Colors.orangeAccent),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              Text(
-                                isPowerOn ? _formatTime(remainingSeconds) : '--:--',
-                                style: TextStyle(
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w900,
-                                  color: !isPowerOn
-                                      ? Colors.grey
-                                      : (isCompressorRunning ? const Color(0xFF00E5FF) : Colors.orangeAccent),
-                                ),
-                              ),
-                            ],
+                          Text(
+                            !isPowerOn ? 'Компресор: В ОЧАКВАНЕ' : (isCompressorRunning ? 'Компресор: РАБОТА' : 'Компресор: ПОЧИВКА'),
+                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: isCompressorRunning ? const Color(0xFF00E5FF) : Colors.orangeAccent),
                           ),
-                          const SizedBox(height: 6),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Text(
-                                'Текущ цикъл: ${_formatTime(activeWorkSeconds)} работа / ${_formatTime(activeRestSeconds)} почивка',
-                                style: const TextStyle(fontSize: 11, color: Colors.white54),
-                              ),
-                            ],
-                          ),
-                          if (hasPendingChanges) ...[
-                            const SizedBox(height: 6),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                              decoration: BoxDecoration(
-                                color: Colors.amber.withOpacity(0.15),
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(color: Colors.amber.withOpacity(0.3)),
-                              ),
-                              child: Row(
-                                children: [
-                                  const Icon(Icons.hourglass_top_rounded, size: 12, color: Colors.amber),
-                                  const SizedBox(width: 6),
-                                  Expanded(
-                                    child: Text(
-                                      'Новите настройки (${_formatTime(pendingWorkSeconds)} / ${_formatTime(pendingRestSeconds)}) ще влязат в сила след този цикъл!',
-                                      style: const TextStyle(fontSize: 10, color: Colors.amber, fontWeight: FontWeight.bold),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
+                          Text(isPowerOn ? _formatTime(remainingSeconds) : '--:--', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900, color: Colors.white)),
                         ],
                       ),
                     ),
 
                     const SizedBox(height: 16),
 
-                    // 🎛️ Лента с бутони: ОХЛАЖДАНЕ и НАСТРОЙКА
+                    // Лента бутони
                     Container(
                       width: double.infinity,
                       padding: const EdgeInsets.all(4),
                       decoration: BoxDecoration(
                         color: Colors.white.withOpacity(0.04),
                         borderRadius: BorderRadius.circular(25),
-                        border: Border.all(color: Colors.white.withOpacity(0.08)),
                       ),
                       child: Row(
                         children: [
-                          // ОХЛАЖДАНЕ
                           Expanded(
                             child: Container(
                               padding: const EdgeInsets.symmetric(vertical: 12),
@@ -488,60 +432,21 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                                 color: isPowerOn ? const Color(0xFF00E5FF) : Colors.white10,
                                 borderRadius: BorderRadius.circular(20),
                               ),
-                              child: Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Icon(Icons.ac_unit_rounded, size: 16, color: isPowerOn ? Colors.black : Colors.grey),
-                                  const SizedBox(width: 6),
-                                  Text(
-                                    'ОХЛАЖДАНЕ',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.bold,
-                                      color: isPowerOn ? Colors.black : Colors.grey,
-                                    ),
-                                  ),
-                                ],
+                              child: Center(
+                                child: Text('ОХЛАЖДАНЕ', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isPowerOn ? Colors.black : Colors.grey)),
                               ),
                             ),
                           ),
-
-                          // НАСТРОЙКА (Колело)
                           Expanded(
                             child: GestureDetector(
-                              onTap: () {
-                                setState(() {
-                                  isSettingsExpanded = !isSettingsExpanded;
-                                });
-                              },
+                              onTap: () => setState(() => isSettingsExpanded = !isSettingsExpanded),
                               child: Container(
                                 padding: const EdgeInsets.symmetric(vertical: 12),
-                                decoration: BoxDecoration(
-                                  color: isSettingsExpanded ? Colors.white.withOpacity(0.15) : Colors.transparent,
-                                  borderRadius: BorderRadius.circular(20),
-                                ),
                                 child: Row(
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
-                                    Icon(
-                                      Icons.settings_suggest_rounded,
-                                      size: 18,
-                                      color: isSettingsExpanded ? const Color(0xFF00E5FF) : Colors.grey[300],
-                                    ),
-                                    const SizedBox(width: 6),
-                                    Text(
-                                      'НАСТРОЙКА',
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        fontWeight: FontWeight.bold,
-                                        color: isSettingsExpanded ? const Color(0xFF00E5FF) : Colors.grey[300],
-                                      ),
-                                    ),
-                                    Icon(
-                                      isSettingsExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-                                      size: 18,
-                                      color: isSettingsExpanded ? const Color(0xFF00E5FF) : Colors.grey[400],
-                                    ),
+                                    Text('НАСТРОЙКА', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: isSettingsExpanded ? const Color(0xFF00E5FF) : Colors.grey[300])),
+                                    Icon(isSettingsExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down, color: Colors.grey),
                                   ],
                                 ),
                               ),
@@ -551,7 +456,7 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                       ),
                     ),
 
-                    // ⚙️ Падащ панел с настройки (Слайдъри до секунди)
+                    // Разширен панел с МРЕЖА (IP + MQTT) И ЗАПИС
                     AnimatedCrossFade(
                       firstChild: const SizedBox(width: double.infinity),
                       secondChild: Container(
@@ -565,87 +470,107 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            const Row(
-                              children: [
-                                Icon(Icons.tune_rounded, size: 18, color: Color(0xFF00E5FF)),
-                                SizedBox(width: 8),
-                                Text(
-                                  'Настройки на таймера за релето',
-                                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white),
-                                ),
-                              ],
+                            const Text('Локална мрежа (NodeMCU IP)', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white)),
+                            const SizedBox(height: 6),
+                            TextField(
+                              controller: _ipController,
+                              style: const TextStyle(fontSize: 13, color: Colors.white),
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: Colors.black26,
+                                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                                hintText: '192.168.1.100',
+                              ),
                             ),
-                            const Divider(color: Colors.white10, height: 20),
-
-                            // Слайдър за Време за Работа
+                            const SizedBox(height: 12),
+                            const Text('MQTT Брокер (Отдалечен достъп)', style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white)),
+                            const SizedBox(height: 6),
+                            TextField(
+                              controller: _mqttBrokerController,
+                              style: const TextStyle(fontSize: 13, color: Colors.white),
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: Colors.black26,
+                                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                                hintText: 'broker.hivemq.com',
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: _mqttTopicController,
+                              style: const TextStyle(fontSize: 13, color: Colors.white),
+                              decoration: InputDecoration(
+                                filled: true,
+                                fillColor: Colors.black26,
+                                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                                hintText: 'home/ac/control',
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton(
+                                onPressed: () async {
+                                  await _saveSettings();
+                                  _syncWithNodeMCU();
+                                  _connectMqtt();
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(content: Text('Настройките са запазени и мрежите са рестартирани!'), duration: Duration(seconds: 1)),
+                                  );
+                                },
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF00E5FF),
+                                  foregroundColor: Colors.black,
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                                ),
+                                child: const Text('ЗАПИШИ И СВЪРЖИ', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                              ),
+                            ),
+                            const Divider(color: Colors.white10, height: 24),
+                            const Text('Настройки на таймера за релето', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.white)),
+                            const SizedBox(height: 12),
+                            
+                            // Слайдър работа
                             Row(
                               mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               children: [
                                 const Text('Време за Работа:', style: TextStyle(fontSize: 12, color: Colors.white70)),
-                                Text(
-                                  '${_formatTime(pendingWorkSeconds)} мин.',
-                                  style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFF00E5FF)),
-                                ),
+                                Text('${_formatTime(pendingWorkSeconds)} мин.', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Color(0xFF00E5FF))),
                               ],
                             ),
-                            SliderTheme(
-                              data: SliderTheme.of(context).copyWith(
-                                activeTrackColor: const Color(0xFF00E5FF),
-                                thumbColor: const Color(0xFF00E5FF),
-                                overlayColor: const Color(0xFF00E5FF).withOpacity(0.2),
-                              ),
-                              child: Slider(
-                                value: pendingWorkSeconds.toDouble(),
-                                min: 10,
-                                max: 900,
-                                divisions: 178,
-                                onChanged: (val) {
-                                  setState(() {
-                                    pendingWorkSeconds = val.round();
-                                    hasPendingChanges = (pendingWorkSeconds != activeWorkSeconds || pendingRestSeconds != activeRestSeconds);
-                                  });
-                                },
-                              ),
+                            Slider(
+                              value: pendingWorkSeconds.toDouble(),
+                              min: 10,
+                              max: 900,
+                              activeColor: const Color(0xFF00E5FF),
+                              onChanged: (val) {
+                                setState(() {
+                                  pendingWorkSeconds = val.round();
+                                  hasPendingChanges = true;
+                                });
+                              },
                             ),
-
                             const SizedBox(height: 8),
 
-                            // Слайдър за Време за Почивка
+                            // Слайдър почивка
                             Row(
                               mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               children: [
                                 const Text('Време за Почивка:', style: TextStyle(fontSize: 12, color: Colors.white70)),
-                                Text(
-                                  '${_formatTime(pendingRestSeconds)} мин.',
-                                  style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.orangeAccent),
-                                ),
+                                Text('${_formatTime(pendingRestSeconds)} мин.', style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.orangeAccent)),
                               ],
                             ),
-                            SliderTheme(
-                              data: SliderTheme.of(context).copyWith(
-                                activeTrackColor: Colors.orangeAccent,
-                                thumbColor: Colors.orangeAccent,
-                                overlayColor: Colors.orangeAccent.withOpacity(0.2),
-                              ),
-                              child: Slider(
-                                value: pendingRestSeconds.toDouble(),
-                                min: 10,
-                                max: 900,
-                                divisions: 178,
-                                onChanged: (val) {
-                                  setState(() {
-                                    pendingRestSeconds = val.round();
-                                    hasPendingChanges = (pendingWorkSeconds != activeWorkSeconds || pendingRestSeconds != activeRestSeconds);
-                                  });
-                                },
-                              ),
-                            ),
-
-                            const SizedBox(height: 8),
-                            // Оправено fontStyle: FontStyle.italic
-                            Text(
-                              '* Плъзни слайдърите за точност до секунди. Новите стойности ще се задействат автоматично, когато текущото отброяване завърши.',
-                              style: TextStyle(fontSize: 10, color: Colors.grey[500], fontStyle: FontStyle.italic),
+                            Slider(
+                              value: pendingRestSeconds.toDouble(),
+                              min: 10,
+                              max: 900,
+                              activeColor: Colors.orangeAccent,
+                              onChanged: (val) {
+                                setState(() {
+                                  pendingRestSeconds = val.round();
+                                  hasPendingChanges = true;
+                                });
+                              },
                             ),
                           ],
                         ),
@@ -663,56 +588,41 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
     );
   }
 
-  // 🌐 Нов Виджет: Горният Панел за Дата, Час и Локална Температура
   Widget _buildNetworkHeader() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(
         color: const Color(0xFF131A28),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white.withOpacity(0.08)),
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
+          Text(_currentTime, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white)),
           Row(
             children: [
-              const Icon(Icons.access_time_filled_rounded, size: 18, color: Color(0xFF00E5FF)),
-              const SizedBox(width: 8),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    _currentTime.isEmpty ? '00:00:00' : _currentTime,
-                    style: const TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                      letterSpacing: 0.8,
-                    ),
-                  ),
-                  Text(
-                    _currentDate,
-                    style: TextStyle(fontSize: 10, color: Colors.grey[400]),
-                  ),
-                ],
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                decoration: BoxDecoration(
+                  color: isConnectedToNodeMCU ? Colors.green.withOpacity(0.2) : Colors.red.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  isConnectedToNodeMCU ? 'IP OK' : 'IP No',
+                  style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: isConnectedToNodeMCU ? Colors.greenAccent : Colors.redAccent),
+                ),
               ),
-            ],
-          ),
-          Row(
-            children: [
-              const Icon(Icons.wb_sunny_rounded, color: Colors.amber, size: 18),
-              const SizedBox(width: 4),
-              Text(
-                '$externalTemp°C',
-                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
-              ),
-              const SizedBox(width: 12),
-              const Icon(Icons.water_drop_rounded, color: Color(0xFF00E5FF), size: 16),
-              const SizedBox(width: 4),
-              Text(
-                '$externalHumidity%',
-                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Colors.white),
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                decoration: BoxDecoration(
+                  color: isMqttConnected ? Colors.blue.withOpacity(0.2) : Colors.grey.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  isMqttConnected ? 'MQTT OK' : 'MQTT Off',
+                  style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: isMqttConnected ? Colors.blueAccent : Colors.grey),
+                ),
               ),
             ],
           ),
@@ -726,33 +636,19 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
       onTap: () {
         setState(() {
           isPowerOn = !isPowerOn;
-          if (isPowerOn) {
-            isCompressorRunning = true;
-            remainingSeconds = activeWorkSeconds;
-          }
+          if (!isPowerOn) isCompressorRunning = false;
         });
+        _syncWithNodeMCU();
+        _sendMqttCommand();
       },
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 300),
-        width: 48,
-        height: 48,
+      child: Container(
+        width: 50,
+        height: 50,
         decoration: BoxDecoration(
           shape: BoxShape.circle,
-          color: isPowerOn ? const Color(0xFF00E5FF) : Colors.white.withOpacity(0.05),
-          boxShadow: [
-            if (isPowerOn)
-              BoxShadow(
-                color: const Color(0xFF00E5FF).withOpacity(0.4),
-                blurRadius: 12,
-                spreadRadius: 1,
-              )
-          ],
+          color: isPowerOn ? const Color(0xFF00E5FF) : const Color(0xFF131A28),
         ),
-        child: Icon(
-          Icons.power_settings_new_rounded,
-          color: isPowerOn ? Colors.black : Colors.white70,
-          size: 24,
-        ),
+        child: Icon(Icons.power_settings_new_rounded, color: isPowerOn ? Colors.black : Colors.grey[400]),
       ),
     );
   }
@@ -761,93 +657,58 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        width: 56,
-        height: 56,
+        width: 44,
+        height: 44,
         decoration: BoxDecoration(
           shape: BoxShape.circle,
-          color: isPrimary ? const Color(0xFF00E5FF).withOpacity(0.15) : Colors.white.withOpacity(0.04),
-          border: Border.all(
-            color: isPrimary ? const Color(0xFF00E5FF) : Colors.white.withOpacity(0.1),
-            width: 1.5,
-          ),
+          color: isPrimary ? const Color(0xFF00E5FF).withOpacity(0.15) : Colors.white.withOpacity(0.05),
         ),
-        child: Icon(
-          icon,
-          color: isPowerOn ? (isPrimary ? const Color(0xFF00E5FF) : Colors.white) : Colors.grey[700],
-          size: 28,
-        ),
+        child: Icon(icon, color: isPrimary ? const Color(0xFF00E5FF) : Colors.white70),
       ),
     );
   }
 }
 
-// 🎨 Рисувател за Колелото
 class WheelPainter extends CustomPainter {
   final double progress;
   final bool isActive;
-
   WheelPainter({required this.progress, required this.isActive});
 
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
-    final radius = size.width / 2 - 10;
-
-    final bgPaint = Paint()
-      ..color = Colors.white.withOpacity(0.08)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 8;
-
-    final activePaint = Paint()
-      ..color = isActive ? const Color(0xFF00E5FF) : Colors.grey[800]!
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round
-      ..strokeWidth = 10;
-
-    canvas.drawCircle(center, radius, bgPaint);
-
-    double sweepAngle = 2 * pi * progress;
-    canvas.drawArc(
-      Rect.fromCircle(center: center, radius: radius),
-      -pi / 2,
-      sweepAngle,
-      false,
-      activePaint,
-    );
+    final radius = min(size.width / 2, size.height / 2) - 8;
+    final bgPaint = Paint()..color = Colors.white12..style = PaintingStyle.stroke..strokeWidth = 6..strokeCap = StrokeCap.round;
+    final progressPaint = Paint()..color = isActive ? const Color(0xFF00E5FF) : Colors.grey[700]!..style = PaintingStyle.stroke..strokeWidth = 6..strokeCap = StrokeCap.round;
+    const startAngle = 0.75 * pi;
+    const sweepAngle = 1.5 * pi;
+    canvas.drawArc(Rect.fromCircle(center: center, radius: radius), startAngle, sweepAngle, false, bgPaint);
+    canvas.drawArc(Rect.fromCircle(center: center, radius: radius), startAngle, sweepAngle * progress, false, progressPaint);
   }
 
   @override
   bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
 
-// ❄️ Модел за Снежинка
 class Snowflake {
   double x = Random().nextDouble();
   double y = Random().nextDouble();
-  double size = Random().nextDouble() * 4 + 2;
-  double speed = Random().nextDouble() * 0.2 + 0.1;
+  double speed = 0.002 + Random().nextDouble() * 0.005;
+  double size = 2 + Random().nextDouble() * 4;
 }
 
-// ❄️ Рисувател за падащи снежинки
 class SnowflakePainter extends CustomPainter {
   final List<Snowflake> snowflakes;
   final double animationValue;
-
   SnowflakePainter(this.snowflakes, this.animationValue);
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = const Color(0xFF00E5FF).withOpacity(0.3)
-      ..style = PaintingStyle.fill;
-
+    final paint = Paint()..color = const Color(0xFF00E5FF).withOpacity(0.6);
     for (var flake in snowflakes) {
-      double currentY = (flake.y + animationValue * flake.speed) % 1.0;
-      canvas.drawCircle(
-        Offset(flake.x * size.width, currentY * size.height),
-        flake.size,
-        paint,
-      );
+      flake.y += flake.speed;
+      if (flake.y > 1.0) flake.y = 0.0;
+      canvas.drawCircle(Offset(flake.x * size.width, flake.y * size.height), flake.size, paint);
     }
   }
 

@@ -9,9 +9,11 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  intl: ^0.20.3
+  intl: ^0.18.1
   mqtt_client: ^10.0.0
   sleek_circular_slider: ^2.0.1
+  http: ^1.2.0
+  shared_preferences: ^2.5.5
 
 dev_dependencies:
   flutter_test:
