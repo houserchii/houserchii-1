@@ -98,7 +98,7 @@ class _ThermostatScreenState extends State<ThermostatScreen> with TickerProvider
   Future<void> _loadSavedSettings() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      _ipController.text = prefs.getString('nodemcu_ip') ?? '192.168.1.100';
+      _ipController.text = prefs.getString('nodemcu_ip') ?? '192.168.4.1';
       _mqttBrokerController.text = prefs.getString('mqtt_broker') ?? 'broker.hivemq.com';
       _mqttTopicController.text = prefs.getString('mqtt_topic') ?? 'home/ac/control';
     });
