@@ -1,0 +1,21 @@
+name: flutter_application_1
+description: AC Smart Control App
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  intl: ^0.20.3
+  mqtt_client: ^10.0.0
+  sleek_circular_slider: ^2.0.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
